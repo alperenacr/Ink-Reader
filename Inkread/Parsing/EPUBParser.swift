@@ -17,80 +17,135 @@ enum EPUBParserError: LocalizedError {
     }
 }
 
-// MARK: - Parser entry point (nonisolated, runs on background thread)
-
 enum EPUBParser {
 
     static func parse(fileURL: URL, bookId: UUID) async throws -> EPUBDocument {
         let url = fileURL
-        let id = bookId
+        let id  = bookId
         return try await Task.detached(priority: .userInitiated) {
             try parseSync(fileURL: url, bookId: id)
         }.value
     }
 
     static func deleteExtracted(for bookId: UUID) {
-        let dir = extractedDir(for: bookId)
-        try? FileManager.default.removeItem(at: dir)
+        try? FileManager.default.removeItem(at: extractedDir(for: bookId))
     }
 
-    // MARK: - Private sync implementation
+    // MARK: - Sync implementation
 
     private static func parseSync(fileURL: URL, bookId: UUID) throws -> EPUBDocument {
         let destDir = extractedDir(for: bookId)
 
-        // Extract if not already done
         if !isExtracted(at: destDir) {
             try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
             try FileManager.default.unzipItem(at: fileURL, to: destDir)
         }
 
-        // container.xml → OPF path
         let opfPath = try parseContainerXML(in: destDir)
         let opfURL  = destDir.appendingPathComponent(opfPath)
         let opfDir  = opfURL.deletingLastPathComponent()
-
-        // OPF → metadata + manifest + spine
-        let opf = try parseOPF(at: opfURL)
+        let opf     = try parseOPF(at: opfURL)
 
         // Cover image
         var coverData: Data?
-        if let coverId = opf.coverImageId,
-           let item = opf.manifest[coverId] {
-            let coverURL = opfDir.appendingPathComponent(item.href)
-            coverData = try? Data(contentsOf: coverURL)
+        if let coverId = opf.coverImageId, let item = opf.manifest[coverId] {
+            coverData = try? Data(contentsOf: opfDir.appendingPathComponent(item.href))
         }
-        // Fallback: look for cover.jpg / cover.png in opfDir
         if coverData == nil {
             for name in ["cover.jpg", "cover.jpeg", "cover.png"] {
                 if let data = try? Data(contentsOf: opfDir.appendingPathComponent(name)) {
-                    coverData = data
-                    break
+                    coverData = data; break
                 }
             }
         }
 
-        // Build chapters from spine
+        // Build chapters
         var chapters: [EPUBChapter] = []
         for (index, idref) in opf.spine.enumerated() {
             guard let item = opf.manifest[idref],
                   item.mediaType.contains("html") else { continue }
-            let chapterURL = opfDir.appendingPathComponent(item.href)
             chapters.append(EPUBChapter(
                 id: item.id,
                 title: "Chapter \(index + 1)",
-                filePath: chapterURL
+                filePath: opfDir.appendingPathComponent(item.href)
             ))
         }
-
         guard !chapters.isEmpty else { throw EPUBParserError.invalidEPUB }
+
+        // Build TOC
+        let toc = buildTOC(opf: opf, opfDir: opfDir, chapters: chapters)
 
         return EPUBDocument(
             title: opf.title.isEmpty ? "Unknown Title" : opf.title,
             author: opf.author.isEmpty ? "Unknown Author" : opf.author,
             coverImageData: coverData,
-            chapters: chapters
+            chapters: chapters,
+            toc: toc
         )
+    }
+
+    // MARK: - TOC
+
+    private static func buildTOC(
+        opf: OPFResult,
+        opfDir: URL,
+        chapters: [EPUBChapter]
+    ) -> [TOCEntry] {
+        // EPUB 3: look for nav item
+        if let navItem = opf.manifest.values.first(where: { $0.properties?.contains("nav") == true }) {
+            let navURL = opfDir.appendingPathComponent(navItem.href)
+            if let entries = parseNavXHTML(at: navURL, chapters: chapters), !entries.isEmpty {
+                return entries
+            }
+        }
+
+        // EPUB 2: look for toc.ncx
+        if let ncxItem = opf.manifest.values.first(where: { $0.mediaType == "application/x-dtbncx+xml" }) {
+            let ncxURL = opfDir.appendingPathComponent(ncxItem.href)
+            if let entries = parseNCX(at: ncxURL, chapters: chapters), !entries.isEmpty {
+                return entries
+            }
+        }
+
+        // Fallback: generate from chapters
+        return chapters.enumerated().map { index, ch in
+            TOCEntry(title: ch.title, href: ch.filePath.lastPathComponent, chapterIndex: index)
+        }
+    }
+
+    private static func parseNavXHTML(at url: URL, chapters: [EPUBChapter]) -> [TOCEntry]? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let delegate = NavXHTMLDelegate()
+        let parser   = XMLParser(data: data)
+        parser.shouldProcessNamespaces = true
+        parser.delegate = delegate
+        parser.parse()
+
+        return delegate.entries.map { raw in
+            let hrefBase = raw.href.components(separatedBy: "#").first ?? raw.href
+            let chIdx = chapters.firstIndex { ch in
+                ch.filePath.lastPathComponent == hrefBase ||
+                ch.filePath.absoluteString.hasSuffix(hrefBase)
+            } ?? 0
+            return TOCEntry(title: raw.title, href: raw.href, chapterIndex: chIdx, level: raw.level)
+        }
+    }
+
+    private static func parseNCX(at url: URL, chapters: [EPUBChapter]) -> [TOCEntry]? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let delegate = NCXDelegate()
+        let parser   = XMLParser(data: data)
+        parser.delegate = delegate
+        parser.parse()
+
+        return delegate.entries.map { raw in
+            let hrefBase = raw.href.components(separatedBy: "#").first ?? raw.href
+            let chIdx = chapters.firstIndex { ch in
+                ch.filePath.lastPathComponent == hrefBase ||
+                ch.filePath.absoluteString.hasSuffix(hrefBase)
+            } ?? 0
+            return TOCEntry(title: raw.title, href: raw.href, chapterIndex: chIdx, level: raw.level)
+        }
     }
 
     // MARK: - Helpers
@@ -107,25 +162,20 @@ enum EPUBParser {
 
     private static func parseContainerXML(in dir: URL) throws -> String {
         let url = dir.appendingPathComponent("META-INF/container.xml")
-        guard let data = try? Data(contentsOf: url) else {
-            throw EPUBParserError.missingContainerXML
-        }
+        guard let data = try? Data(contentsOf: url) else { throw EPUBParserError.missingContainerXML }
         let delegate = ContainerXMLDelegate()
-        let parser = XMLParser(data: data)
+        let parser   = XMLParser(data: data)
         parser.delegate = delegate
         parser.parse()
-        guard let path = delegate.opfPath else {
-            throw EPUBParserError.missingOPFPath
-        }
+        guard let path = delegate.opfPath else { throw EPUBParserError.missingOPFPath }
         return path
     }
 
     private static func parseOPF(at url: URL) throws -> OPFResult {
-        guard let data = try? Data(contentsOf: url) else {
-            throw EPUBParserError.missingOPFFile
-        }
+        guard let data = try? Data(contentsOf: url) else { throw EPUBParserError.missingOPFFile }
         let delegate = OPFXMLDelegate()
-        let parser = XMLParser(data: data)
+        let parser   = XMLParser(data: data)
+        parser.shouldProcessNamespaces = true
         parser.delegate = delegate
         parser.parse()
         return OPFResult(
@@ -148,83 +198,133 @@ private struct OPFResult {
     let coverImageId: String?
 }
 
-// MARK: - XML delegates
+private struct RawTOCEntry {
+    let title: String
+    let href: String
+    let level: Int
+}
+
+// MARK: - XML Delegates
 
 private final class ContainerXMLDelegate: NSObject, XMLParserDelegate {
     var opfPath: String?
-
-    func parser(
-        _ parser: XMLParser,
-        didStartElement elementName: String,
-        namespaceURI: String?,
-        qualifiedName _: String?,
-        attributes: [String: String] = [:]
-    ) {
-        if elementName == "rootfile" {
-            opfPath = attributes["full-path"]
-        }
+    func parser(_ p: XMLParser, didStartElement el: String, namespaceURI: String?,
+                qualifiedName _: String?, attributes attr: [String: String] = [:]) {
+        if el == "rootfile" { opfPath = attr["full-path"] }
     }
 }
 
 private final class OPFXMLDelegate: NSObject, XMLParserDelegate {
-    var title = ""
-    var author = ""
+    var title = ""; var author = ""
     var manifest: [String: ManifestItem] = [:]
     var spine: [String] = []
     var coverImageId: String?
+    private var currentElement = ""; private var currentText = ""
 
-    private var currentElement = ""
-    private var currentText = ""
-
-    func parser(
-        _ parser: XMLParser,
-        didStartElement elementName: String,
-        namespaceURI: String?,
-        qualifiedName _: String?,
-        attributes: [String: String] = [:]
-    ) {
-        currentElement = elementName
-        currentText = ""
-
-        switch elementName {
+    func parser(_ p: XMLParser, didStartElement el: String, namespaceURI ns: String?,
+                qualifiedName _: String?, attributes attr: [String: String] = [:]) {
+        currentElement = el; currentText = ""
+        switch el {
         case "item":
-            let id = attributes["id"] ?? UUID().uuidString
-            let item = ManifestItem(
-                id: id,
-                href: attributes["href"] ?? "",
-                mediaType: attributes["media-type"] ?? "",
-                properties: attributes["properties"]
-            )
+            let id   = attr["id"] ?? UUID().uuidString
+            let item = ManifestItem(id: id, href: attr["href"] ?? "",
+                                    mediaType: attr["media-type"] ?? "",
+                                    properties: attr["properties"])
             manifest[id] = item
-            if item.properties?.contains("cover-image") == true || id.lowercased().contains("cover") {
+            if item.properties?.contains("cover-image") == true || id.lowercased() == "cover-image" {
                 if coverImageId == nil { coverImageId = id }
             }
         case "itemref":
-            if let idref = attributes["idref"] { spine.append(idref) }
-        default:
-            break
+            if let idref = attr["idref"] { spine.append(idref) }
+        default: break
         }
     }
 
-    func parser(_ parser: XMLParser, foundCharacters string: String) {
-        currentText += string
-    }
+    func parser(_ p: XMLParser, foundCharacters s: String) { currentText += s }
 
-    func parser(
-        _ parser: XMLParser,
-        didEndElement elementName: String,
-        namespaceURI: String?,
-        qualifiedName _: String?
-    ) {
-        let text = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
-        switch elementName {
-        case "dc:title", "title":
-            if title.isEmpty && !text.isEmpty { title = text }
-        case "dc:creator", "creator":
-            if author.isEmpty && !text.isEmpty { author = text }
-        default:
-            break
-        }
+    func parser(_ p: XMLParser, didEndElement el: String, namespaceURI: String?,
+                qualifiedName _: String?) {
+        let t = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (el == "dc:title"   || el == "title")   && title.isEmpty  && !t.isEmpty { title  = t }
+        if (el == "dc:creator" || el == "creator") && author.isEmpty && !t.isEmpty { author = t }
         currentText = ""
+    }
+}
+
+// EPUB 3 nav.xhtml parser
+private final class NavXHTMLDelegate: NSObject, XMLParserDelegate {
+    var entries: [RawTOCEntry] = []
+    private var inTOCNav  = false
+    private var level     = 0
+    private var currentText = ""
+    private var pendingHref: String?
+
+    func parser(_ p: XMLParser, didStartElement el: String, namespaceURI ns: String?,
+                qualifiedName _: String?, attributes attr: [String: String] = [:]) {
+        let localName = el.components(separatedBy: ":").last ?? el
+        if localName == "nav" && (attr["epub:type"] ?? attr["type"] ?? "").contains("toc") {
+            inTOCNav = true
+        }
+        if inTOCNav {
+            if localName == "ol" { level += 1 }
+            if localName == "a"  { pendingHref = attr["href"]; currentText = "" }
+        }
+    }
+
+    func parser(_ p: XMLParser, foundCharacters s: String) {
+        if inTOCNav { currentText += s }
+    }
+
+    func parser(_ p: XMLParser, didEndElement el: String, namespaceURI: String?,
+                qualifiedName _: String?) {
+        let localName = el.components(separatedBy: ":").last ?? el
+        if inTOCNav {
+            if localName == "a", let href = pendingHref {
+                let title = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !title.isEmpty {
+                    entries.append(RawTOCEntry(title: title, href: href, level: max(0, level - 1)))
+                }
+                pendingHref = nil; currentText = ""
+            }
+            if localName == "ol" { level -= 1 }
+            if localName == "nav" { inTOCNav = false }
+        }
+    }
+}
+
+// EPUB 2 toc.ncx parser
+private final class NCXDelegate: NSObject, XMLParserDelegate {
+    var entries: [RawTOCEntry] = []
+    private var depth = 0
+    private var currentTitle = ""
+    private var currentSrc   = ""
+    private var inLabel = false
+
+    func parser(_ p: XMLParser, didStartElement el: String, namespaceURI: String?,
+                qualifiedName _: String?, attributes attr: [String: String] = [:]) {
+        switch el {
+        case "navPoint":  depth += 1
+        case "text":      if depth > 0 { inLabel = true; currentTitle = "" }
+        case "content":   currentSrc = attr["src"] ?? ""
+        default: break
+        }
+    }
+
+    func parser(_ p: XMLParser, foundCharacters s: String) {
+        if inLabel { currentTitle += s }
+    }
+
+    func parser(_ p: XMLParser, didEndElement el: String, namespaceURI: String?,
+                qualifiedName _: String?) {
+        switch el {
+        case "text": inLabel = false
+        case "navPoint":
+            let title = currentTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !title.isEmpty && !currentSrc.isEmpty {
+                entries.append(RawTOCEntry(title: title, href: currentSrc, level: depth - 1))
+            }
+            depth -= 1; currentTitle = ""; currentSrc = ""
+        default: break
+        }
     }
 }

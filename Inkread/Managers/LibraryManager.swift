@@ -40,6 +40,9 @@ final class LibraryManager {
 
     func deleteFile(for book: Book) {
         try? FileManager.default.removeItem(at: fileURL(for: book))
+        if book.fileFormat == .epub {
+            EPUBParser.deleteExtracted(for: book.id)
+        }
     }
 
     func fileExists(for book: Book) -> Bool {

@@ -15,7 +15,13 @@ struct ReaderView: View {
         ZStack {
             theme.currentTheme.backgroundColor.ignoresSafeArea()
 
-            if isLoading {
+            if book.fileFormat == .pdf {
+                // PDF: route directly, no parsing needed
+                PDFContainerView(book: book)
+                    .environment(theme)
+                    .environment(settings)
+                    .onAppear { isLoading = false }
+            } else if isLoading {
                 loadingView
             } else if let error = loadError {
                 errorView(error)
@@ -24,7 +30,10 @@ struct ReaderView: View {
             }
         }
         .navigationBarHidden(true)
-        .task { await loadDocument() }
+        .task {
+            guard book.fileFormat == .epub else { return }
+            await loadEPUB()
+        }
     }
 
     // MARK: - States
@@ -45,12 +54,10 @@ struct ReaderView: View {
             Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 44, weight: .thin))
                 .foregroundStyle(theme.currentTheme.secondaryTextColor)
-
             VStack(spacing: 8) {
                 Text("Could not open book")
                     .font(.system(size: 18, weight: .semibold, design: .serif))
                     .foregroundStyle(theme.currentTheme.textColor)
-
                 Text(message)
                     .font(.system(size: 14))
                     .foregroundStyle(theme.currentTheme.secondaryTextColor)
@@ -63,34 +70,21 @@ struct ReaderView: View {
     // MARK: - Loading
 
     @MainActor
-    private func loadDocument() async {
-        guard book.fileFormat == .epub else {
-            loadError = "PDF support coming soon."
-            isLoading = false
-            return
-        }
-
-        let fileURL = LibraryManager.shared.fileURL(for: book)
-
+    private func loadEPUB() async {
         guard LibraryManager.shared.fileExists(for: book) else {
             loadError = "Book file not found."
             isLoading = false
             return
         }
 
+        let fileURL = LibraryManager.shared.fileURL(for: book)
+
         do {
             let doc = try await EPUBParser.parse(fileURL: fileURL, bookId: book.id)
 
-            // Enrich book metadata from parsed EPUB
-            if book.title == doc.title || book.title.isEmpty {
-                book.title = doc.title
-            }
-            if book.author == "Unknown Author" && !doc.author.isEmpty {
-                book.author = doc.author
-            }
-            if book.coverImageData == nil, let cover = doc.coverImageData {
-                book.coverImageData = cover
-            }
+            if book.title == "Unknown Title" || book.title.isEmpty { book.title = doc.title }
+            if book.author == "Unknown Author" && !doc.author.isEmpty { book.author = doc.author }
+            if book.coverImageData == nil, let cover = doc.coverImageData { book.coverImageData = cover }
 
             document = doc
         } catch {

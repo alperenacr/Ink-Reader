@@ -12,6 +12,6 @@ struct InkreadApp: App {
                 .environment(themeManager)
                 .environment(settingsManager)
         }
-        .modelContainer(for: Book.self)
+        .modelContainer(for: [Book.self, Highlight.self, Bookmark.self])
     }
 }
