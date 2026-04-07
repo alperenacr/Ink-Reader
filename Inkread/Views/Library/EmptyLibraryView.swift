@@ -14,11 +14,11 @@ struct EmptyLibraryView: View {
 
             VStack(spacing: 10) {
                 Text("Your library is empty")
-                    .font(.system(size: 22, weight: .semibold, design: .serif))
+                    .font(.system(.title3, design: .serif).weight(.semibold))
                     .foregroundStyle(theme.currentTheme.textColor)
 
                 Text("Import EPUB or PDF files\nto start reading")
-                    .font(.system(size: 15))
+                    .font(.body)
                     .foregroundStyle(theme.currentTheme.secondaryTextColor)
                     .multilineTextAlignment(.center)
                     .lineSpacing(4)
@@ -27,9 +27,9 @@ struct EmptyLibraryView: View {
             Button(action: onImport) {
                 HStack(spacing: 8) {
                     Image(systemName: "plus")
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(.subheadline, design: .default).weight(.semibold))
                     Text("Import Book")
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(.headline)
                 }
                 .foregroundStyle(theme.currentTheme.backgroundColor)
                 .padding(.horizontal, 32)

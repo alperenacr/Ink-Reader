@@ -11,12 +11,12 @@ struct BookCardView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(book.title)
-                    .font(.system(size: 12, weight: .medium, design: .serif))
+                    .font(.system(.caption, design: .serif).weight(.medium))
                     .foregroundStyle(theme.currentTheme.textColor)
                     .lineLimit(2)
 
                 Text(book.author)
-                    .font(.system(size: 11))
+                    .font(.caption2)
                     .foregroundStyle(theme.currentTheme.secondaryTextColor)
                     .lineLimit(1)
             }
